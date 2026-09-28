@@ -1,7 +1,11 @@
 import importlib.util
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+from click.testing import CliRunner
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "tools" / "annotate_funasr.py"
 
@@ -154,6 +158,64 @@ class AnnotateFunASRTests(unittest.TestCase):
         )
 
         self.assertEqual(text, "欢迎使用 Fish Speech")
+
+    def test_failed_atomic_replace_preserves_label_and_removes_temporary_file(self):
+        label = self.root / "sample.lab"
+        label.write_bytes(b"curated text\n")
+
+        with patch.object(Path, "replace", side_effect=OSError("replace failed")):
+            with self.assertRaisesRegex(OSError, "replace failed"):
+                self.module.write_label(label, "replacement")
+
+        self.assertEqual(label.read_bytes(), b"curated text\n")
+        self.assertEqual(list(self.root.iterdir()), [label])
+
+    def test_failed_flush_preserves_label_and_removes_temporary_file(self):
+        label = self.root / "sample.lab"
+        label.write_bytes(b"curated text\n")
+
+        with patch.object(self.module.os, "fsync", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                self.module.write_label(label, "replacement")
+
+        self.assertEqual(label.read_bytes(), b"curated text\n")
+        self.assertEqual(list(self.root.iterdir()), [label])
+
+    def test_cli_dry_run_needs_no_funasr_and_preserves_labels(self):
+        first = touch(self.root / "a.wav")
+        second = touch(self.root / "b.mp3")
+        label = first.with_suffix(".lab")
+        label.write_bytes(b"curated text\n")
+
+        with patch.dict(sys.modules, {"funasr": None}):
+            result = CliRunner().invoke(
+                self.module.main, [str(self.root), "--dry-run", "--device", "cpu"]
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn(
+            "discovered=2, processed=0, skipped=1, failed=0, planned=1",
+            result.output,
+        )
+        self.assertEqual(label.read_bytes(), b"curated text\n")
+        self.assertFalse(second.with_suffix(".lab").exists())
+
+    def test_cli_missing_funasr_reports_all_failures_and_exits_nonzero(self):
+        touch(self.root / "a.wav")
+        touch(self.root / "b.flac")
+
+        with patch.dict(sys.modules, {"funasr": None}):
+            result = CliRunner().invoke(
+                self.module.main, [str(self.root), "--device", "cpu"]
+            )
+
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn(
+            "discovered=2, processed=0, skipped=0, failed=2, planned=0",
+            result.output,
+        )
+        self.assertEqual(list(self.root.glob("*.lab")), [])
+        self.assertEqual(list(self.root.glob(".*.tmp")), [])
 
 
 if __name__ == "__main__":
